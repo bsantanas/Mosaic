@@ -17,7 +17,7 @@ class ViewController: UIViewController {
     //MARK: - Outlets
     @IBOutlet var imageView: UIImageView!
     @IBOutlet var pixelSizeSlider: UISlider!
-    //let metalView = VideoMetalView(frame: CGRect.zero)
+    let metalView = VideoMetalView(frame: CGRect.zero)
     
     // MARK: - Metal Configuration
     var videoTextureCache : CVMetalTextureCache?
@@ -44,7 +44,7 @@ class ViewController: UIViewController {
         
         self.device = device
         
-       // metalView.framebufferOnly = false
+        metalView.framebufferOnly = false
         
         // Texture for Y
         CVMetalTextureCacheCreate(kCFAllocatorDefault, nil, device, nil, &videoTextureCache)
@@ -101,11 +101,11 @@ class ViewController: UIViewController {
         
         // although we don't use this, it's required to get captureOutput invoked
         let previewLayer = AVCaptureVideoPreviewLayer(session: captureSession)
-        previewLayer!.frame = view.layer.bounds // comment to "hide"
+//        previewLayer!.frame = view.layer.bounds // comment to "hide"
         previewLayer!.videoGravity = AVLayerVideoGravityResizeAspectFill
         view.layer.addSublayer(previewLayer!)
         
-//        view.addSubview(metalView)
+        view.addSubview(metalView)
         
         captureSession.startRunning()
         
@@ -159,14 +159,14 @@ class ViewController: UIViewController {
     }
 
     
-//    override func viewDidLayoutSubviews()
-//    {
-//        metalView.frame = view.bounds
-//        
-//        metalView.drawableSize = CGSize(width: view.bounds.width * 2, height: view.bounds.height * 2)
-//        
-//        
-//    }
+    override func viewDidLayoutSubviews()
+    {
+        metalView.frame = view.bounds
+        
+        metalView.drawableSize = CGSize(width: view.bounds.width * 2, height: view.bounds.height * 2)
+        
+        
+    }
     
     // MARK: -
     
@@ -198,25 +198,14 @@ class ViewController: UIViewController {
     
     func textureFrom(_ image: UIImage) -> MTLTexture {
         
-        //Rotate image so that y points downards in the texture
-        UIGraphicsBeginImageContext(image.size);
-        let context = UIGraphicsGetCurrentContext()
-        context!.rotate(by: CGFloat(M_PI))
-        image.draw(at: CGPoint(x:0,y:0))
-        let image = UIGraphicsGetImageFromCurrentImageContext()
-        UIGraphicsEndImageContext()
-
-        
-        guard let cgImage = image!.cgImage else {
+        guard let cgImage = image.cgImage else {
             fatalError("Can't open image \(image)")
         }
-        
-        
+
         let textureLoader = MTKTextureLoader(device: self.device)
         do {
-            let textureOut = try textureLoader.newTexture(with: cgImage, options: nil)
-            print(textureOut.pixelFormat)
-            let pixelFormat = MTLPixelFormat.bgra8Unorm
+            let textureOut = try textureLoader.newTexture(with: cgImage, options: [MTKTextureLoaderOptionOrigin:MTKTextureLoaderOriginTopLeft as NSObject])
+            print(textureOut.pixelFormat == MTLPixelFormat.bgra8Unorm)
             let textureDescriptor = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: textureOut.pixelFormat, width: textureOut.width, height: textureOut.height, mipmapped: false)
             outTexture = self.device.makeTexture(descriptor: textureDescriptor)
             return textureOut
@@ -312,7 +301,10 @@ extension ViewController: AVCaptureVideoDataOutputSampleBufferDelegate {
         let yTexture:MTLTexture? = CVMetalTextureGetTexture(yTextureRef!)
         let cbcrTexture:MTLTexture? = CVMetalTextureGetTexture(cbcrTextureRef!)
         
-        //self.metalView.addTextures(yTexture: yTexture!, cbcrTexture: cbcrTexture!)
+        let intermediateTextureDesciptor = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: MTLPixelFormat.rgba8Unorm, width: Int(yTexture!.width), height: Int(yTexture!.height), mipmapped: false)
+        let intermediateTexture = device.makeTexture(descriptor: intermediateTextureDesciptor)
+        
+        self.metalView.addTextures(yTexture: yTexture!, cbcrTexture: cbcrTexture!, intermediateTexture: intermediateTexture)
         
     }
 }
@@ -322,8 +314,10 @@ class VideoMetalView: MTKView  {
     
     var ytexture:MTLTexture?
     var cbcrTexture: MTLTexture?
+    var intermediateTexture: MTLTexture?
     
-    var pipelineState: MTLComputePipelineState!
+    var pipelineStateA: MTLComputePipelineState!
+    var pipelineStateB: MTLComputePipelineState!
     let queue = DispatchQueue(label: "com.invasivecode.metalQueue")
     lazy var defaultLibrary: MTLLibrary! = {
         self.device!.newDefaultLibrary()
@@ -332,7 +326,6 @@ class VideoMetalView: MTKView  {
         NSLog("\(self.device!.name!)")
         return self.device!.makeCommandQueue()
     }()
-    let bytesPerPixel: Int = 4
     let threadGroupCount = MTLSizeMake(16, 16, 1)
     lazy var threadGroups: MTLSize = {
         MTLSizeMake(Int(self.ytexture!.width) / self.threadGroupCount.width, Int(self.ytexture!.height) / self.threadGroupCount.height, 1)
@@ -342,13 +335,22 @@ class VideoMetalView: MTKView  {
     required init(frame: CGRect) {
         super.init(frame: frame, device:  MTLCreateSystemDefaultDevice())
         
-        let kernelFunction = defaultLibrary.makeFunction(name: "YCbCrColorConversion")
+        let kernelFunctionA = defaultLibrary.makeFunction(name: "YCbCrColorConversion")
         
         do {
-            pipelineState = try device!.makeComputePipelineState(function: kernelFunction!)
+            pipelineStateA = try device!.makeComputePipelineState(function: kernelFunctionA!)
         } catch {
             fatalError("Unable to create pipeline state")
         }
+        
+        let kernelFunctionB = defaultLibrary.makeFunction(name: "pixelate")
+        
+        do {
+            pipelineStateB = try device!.makeComputePipelineState(function: kernelFunctionB!)
+        } catch {
+            fatalError("Unable to create pipeline state")
+        }
+
         
         //threadGroups = MTLSizeMake(2048 / threadGroupCount.width, 1536 / threadGroupCount.height, 1)
         
@@ -361,10 +363,10 @@ class VideoMetalView: MTKView  {
     }
     
     
-    func addTextures(yTexture ytexture:MTLTexture, cbcrTexture: MTLTexture)
-    {
+    func addTextures(yTexture ytexture:MTLTexture, cbcrTexture: MTLTexture, intermediateTexture:MTLTexture) {
         self.ytexture = ytexture
         self.cbcrTexture = cbcrTexture
+        self.intermediateTexture = intermediateTexture
     }
     
     func setBlurSigma(sigma: Float)
@@ -373,31 +375,36 @@ class VideoMetalView: MTKView  {
     }
     
     override func draw(_ dirtyRect: CGRect) {
+        
         guard let drawable = currentDrawable, let ytexture = ytexture, let cbcrTexture = cbcrTexture else { return }
         
         let commandBuffer = commandQueue.makeCommandBuffer()
         let commandEncoder = commandBuffer.makeComputeCommandEncoder()
         
-        commandEncoder.setComputePipelineState(pipelineState)
+        commandEncoder.setComputePipelineState(pipelineStateA)
         
         commandEncoder.setTexture(ytexture, at: 0)
         commandEncoder.setTexture(cbcrTexture, at: 1)
-        commandEncoder.setTexture(drawable.texture, at: 2) // out texture
+        commandEncoder.setTexture(intermediateTexture, at: 2) // out texture
         
         commandEncoder.dispatchThreadgroups(threadGroups, threadsPerThreadgroup: threadGroupCount)
         
         commandEncoder.endEncoding()
         
-        let inPlaceTexture = UnsafeMutablePointer<MTLTexture?>.allocate(capacity: 1)
-        inPlaceTexture.initialize(to: drawable.texture)
-        
+//        let inPlaceTexture = UnsafeMutablePointer<MTLTexture?>.allocate(capacity: 1) inPlaceTexture.initialize(to: drawable.texture)
 //        blur.encodeToCommandBuffer(commandBuffer, inPlaceTexture: inPlaceTexture, fallbackCopyAllocator: nil)
         
-        let buffer = device?.makeBuffer(bytes: &pixelSize, length: MemoryLayout<UInt>.size, options: [MTLResourceOptions.storageModeShared])
-        commandEncoder.setBuffer(buffer, offset: 0, at: 0)
-        commandEncoder.endEncoding()
-
+        let commandEncoderb = commandBuffer.makeComputeCommandEncoder()
+        commandEncoderb.setComputePipelineState(pipelineStateB)
+        commandEncoderb.setTexture(intermediateTexture, at: 0)
+        commandEncoderb.setTexture(drawable.texture, at: 1)
         
+        let buffer = device?.makeBuffer(bytes: &pixelSize, length: MemoryLayout<UInt>.size, options: [MTLResourceOptions.storageModeShared])
+        commandEncoderb.setBuffer(buffer, offset: 0, at: 0)
+        
+        commandEncoderb.dispatchThreadgroups(threadGroups, threadsPerThreadgroup: threadGroupCount)
+        commandEncoderb.endEncoding()
+
         commandBuffer.present(drawable)
         commandBuffer.commit();
 //        commandBuffer.waitUntilCompleted()
